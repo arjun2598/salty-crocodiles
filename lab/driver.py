@@ -130,7 +130,8 @@ def main() -> None:
 
     jr.run_start(member=args.member, agent=args.agent, git_sha=git_sha(),
                  model=meter.label, limits=limits, data_dir=args.data_dir,
-                 seeds=agent.seeds_for(RunState(), "draft"), dev_mode=args.dev)
+                 seeds=agent.seeds_for(RunState(), "draft"), dev_mode=args.dev,
+                 seed_baseline=args.seed_baseline)
 
     state = RunState(iters_left=limits["max_iterations"],
                      seconds_left=limits["wall_clock_s"])
@@ -244,6 +245,7 @@ def main() -> None:
             attempt += 1
             action = agent.on_failure(node, attempt, state)
             recovery = {"action": action, "attempt": attempt, "resolved": False}
+            state.last_recovery = action     # select() must honour this
             err = json.loads(node.error) if node.error else {}
             print(f"  {node.status}: {err.get('type','?')} "
                   f"{textwrap.shorten(err.get('message',''), 90)} -> {action}")
@@ -256,6 +258,7 @@ def main() -> None:
                 stop_reason = "aborted"; break
         else:
             attempt = 0
+            state.last_recovery = None
             accept, why = agent.judge(node, state.best, state)        # 7
             node = Node(**{**node.__dict__, "accepted": accept})
             if accept:

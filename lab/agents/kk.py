@@ -19,6 +19,8 @@ that list is your backlog.
 """
 from __future__ import annotations
 
+import json
+
 from core import LIMITS, Node, RunState, Stage, rough_tokens
 
 BASE = LIMITS["baseline_primary"]["valid"]      # 0.6016 -- the bar
@@ -29,7 +31,8 @@ CEILING = LIMITS["oracle_primary"]["valid"]     # 0.8484 -- perfect ranking
 # 1. SEARCH -- what do we work on next?
 # ==========================================================================
 def select(state: RunState) -> tuple[Node | None, Stage]:
-    """Greedy: always expand the best node; debug in place on failure.
+    """Expand the best node; debug in place on failure -- unless on_failure
+    asked for a rollback, in which case go back to what worked.
 
     Does NOT: track which axis (features / loss / model / training) a node
     explored, notice that an axis has stopped paying and force a switch, back
@@ -39,6 +42,13 @@ def select(state: RunState) -> tuple[Node | None, Stage]:
     """
     if not state.nodes:
         return None, "draft"
+
+    # on_failure decided this branch is not worth more budget. Honour it --
+    # otherwise "rollback" is journalled but never acted on, and the run keeps
+    # debugging a node the repair policy already gave up on.
+    if state.last_recovery == "rollback" and state.best is not None:
+        return state.best, "improve"
+
     last = state.nodes[-1]
     if last.status != "ok":
         return last, "debug"
@@ -142,6 +152,16 @@ OUTPUT CONTRACT
   You are free to ignore guard.encode and build your own features from the
   tuples. Do not import pandas, sklearn, or torch.
 
+  READING YOUR OWN RESULTS
+  - GAUC below 0.5 means your ranking is INVERTED. Random scoring gets 0.5, so
+    scoring worse takes real signal pointed backwards -- look for a sign error
+    in a gradient or in how the score is formed, not for a better model.
+  - GAUC exactly 0.5000 means every score is identical, so every pair ties.
+    The model collapsed; check for saturation, a zero learning rate, or
+    clipping that flattened everything.
+  - A pairwise loss needs, per user, a positive and a negative. Labels are
+    floats; do not use a label as an index.
+
   WHAT IS ALREADY KNOWN -- these were measured by the organizers. Do not
   re-run them.
 
@@ -219,11 +239,23 @@ def build(state: RunState, parent: Node | None, stage: Stage,
         ask = ("Write a first solution. A factorization machine over the "
                "categorical fields is a reasonable starting point.")
     elif stage == "debug":
-        ask = ("The solution above failed. Diagnose it from the error, then "
-               "output a corrected complete solution.py.")
+        ask = ("The solution above failed. Fix ONLY the error.\n"
+               "Change as little as possible: keep the same model, the same "
+               "loss, the same hyperparameters, the same structure. Do not "
+               "take the opportunity to try a different idea -- a repair that "
+               "also rewrites the approach cannot be told apart from a "
+               "regression, and it wastes the iteration either way.\n"
+               "State the root cause in the HYPOTHESIS line, then output the "
+               "complete corrected solution.py.")
     else:
-        ask = ("Improve on the solution above. Change one thing, say why in "
-               "the HYPOTHESIS line, and output the complete new solution.py.")
+        ask = ("Improve on the solution above. Change ONE thing.\n"
+               "Copy everything you are not changing VERBATIM from the current "
+               "solution -- the training loop, the encoder, the argument "
+               "parsing and the output writing already work. Most failures in "
+               "this run came from retyping code that was already correct, not "
+               "from the idea being wrong.\n"
+               "Say what you are changing and why in the HYPOTHESIS line, then "
+               "output the complete new solution.py.")
 
     budget = (f"Iteration {state.iteration}. {state.iters_left} iterations and "
               f"{int(state.seconds_left / 60)} minutes remain.")
@@ -260,6 +292,9 @@ def judge(candidate: Node, incumbent: Node | None,
     if candidate.metrics.get("degenerate"):
         return False, "constant scores -- every pair ties, GAUC is 0.5 by "\
                       "construction. The model is broken, not weak."
+    if candidate.metrics.get("inverted"):
+        return False, "GAUC below 0.45 -- the ranking is inverted (random is "\
+                      "0.5). Sign error, not a weak model."
     if incumbent is None or incumbent.metrics is None:
         return True, "first scored solution becomes the incumbent"
     delta = candidate.primary - incumbent.primary
@@ -275,21 +310,60 @@ def judge(candidate: Node, incumbent: Node | None,
 # ==========================================================================
 MAX_ATTEMPTS = 3
 
+# Failures a traceback usually lets the model fix on the next try.
+FIXABLE = {"TypeError", "AttributeError", "NameError", "IndexError",
+           "KeyError", "ValueError", "ImportError", "ModuleNotFoundError",
+           "NoCode", "Misaligned", "NoOutput"}
+
+
+def _error_type(node: Node) -> str:
+    if not node.error:
+        return ""
+    try:
+        return json.loads(node.error).get("type", "")
+    except (ValueError, TypeError):
+        return ""
+
 
 def on_failure(node: Node, attempt: int, state: RunState) -> str:
-    """Retry with the traceback, roll back once there is something to roll back
-    to, and only abandon when the budget is genuinely spent.
+    """Route by what actually broke.
 
-    Abandoning while no solution has EVER worked kills the run at iteration 2
-    with 48 iterations unused -- the early drafts are exactly where failures
-    are expected. Never abandon while iterations remain.
-
-    Still does NOT: distinguish a missing import from a logic bug from a
-    timeout, notice it is retrying the same wrong fix twice, or shrink the
-    problem when the failure was a timeout.
+    Under the literal convergence rule every iteration counts toward the
+    3-iteration window, so a crash costs an iteration AND a convergence slot.
+    Retrying blindly is expensive; retrying the same failing idea twice is
+    worse.
     """
-    if attempt < MAX_ATTEMPTS:
+    kind = _error_type(node)
+
+    # Same error type twice running -> the repair is not working. More of the
+    # same will not help; go back to something that ran.
+    prior = [_error_type(n) for n in state.nodes if n.status != "ok"]
+    if kind and prior[-1:] == [kind] and attempt >= 2:
+        return "rollback" if state.best_id else "retry"
+
+    # A timeout means the work was too big, not that the code was wrong.
+    # Re-running identical code times out identically. One retry (the model
+    # sees the timeout and can shrink the job), then fall back.
+    if node.status == "timeout":
+        return "retry" if attempt < 2 else (
+            "rollback" if state.best_id else "abandon")
+
+    # NaN/Inf is numerical, not structural -- worth a retry, but it usually
+    # means the learning rate or an unclipped exp/log needs bounding, and if
+    # two attempts do not settle it the branch is not worth more budget.
+    if kind == "NonFinite":
+        return "retry" if attempt < 2 else (
+            "rollback" if state.best_id else "retry")
+
+    # Reaching around the data wall is a prompt problem, not a code problem.
+    # Retrying the same request produces the same violation.
+    if node.status == "leak":
+        return "rollback" if state.best_id else "retry"
+
+    if kind in FIXABLE and attempt < MAX_ATTEMPTS:
         return "retry"
     if state.best_id:
         return "rollback"
+    # Never abandon while iterations remain -- early drafts are exactly where
+    # failures are expected, and abandoning kills the run with budget unused.
     return "retry" if state.iters_left > 1 else "abandon"

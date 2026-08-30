@@ -82,7 +82,8 @@ def main() -> None:
     d = tempfile.mkdtemp()
     jr = core.Journal(d, "selfcheck")
     jr.run_start(member="selfcheck", agent="v0", git_sha="0", model="none",
-                 limits=L, data_dir="-", seeds=[0], dev_mode=True)
+                 limits=L, data_dir="-", seeds=[0], dev_mode=True,
+                 seed_baseline=True)
     n = core.Node(id="n1", parent_id=None, stage="draft", hypothesis="h",
                       code="pass", diff="", metrics={"GAUC": .1, "nDCG@5": .1,
                       "primary": .1, "users": 1, "rows": 1}, error=None,

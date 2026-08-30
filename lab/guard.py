@@ -11,6 +11,8 @@ from __future__ import annotations
 import os
 import sys
 
+import numpy as np
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
@@ -38,8 +40,17 @@ def load(data_dir: str | None = None) -> dict:
 
 
 def encode(splits: dict):
-    """Passthrough to the reference encoder. Solutions are free to replace it."""
-    return _reference.encode(splits)
+    """Reference encoder, with one fix: `users` comes back as a numpy array.
+
+    The root data.py returns X and y as numpy but users as a Python list. Any
+    solution doing batched per-user work -- which is what BPR and listwise
+    losses need -- then hits `TypeError: only integer scalar arrays can be
+    converted to a scalar index` on users[batch_idx]. Making the three arrays
+    consistent removes a whole class of failure that has nothing to do with
+    the research question.
+    """
+    enc, dim = _reference.encode(splits)
+    return {k: (X, y, np.asarray(users)) for k, (X, y, users) in enc.items()}, dim
 
 
 def valid_targets(data_dir: str | None = None) -> tuple[list, list]:

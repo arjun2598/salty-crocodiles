@@ -76,6 +76,7 @@ class RunState:
     iters_left: int = 0
     seconds_left: float = 0.0
     tokens_used: int = 0
+    last_recovery: str | None = None   # what on_failure decided last iteration
 
     def by_id(self, node_id):
         return next((n for n in self.nodes if n.id == node_id), None) if node_id else None
@@ -165,11 +166,15 @@ class Journal:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
     def run_start(self, *, member, agent, git_sha, model, limits,
-                  data_dir, seeds, dev_mode) -> None:
+                  data_dir, seeds, dev_mode, seed_baseline) -> None:
         self._write({
             "record": "run_start", "run_id": self.run_id, "member": member,
             "agent": agent, "started_at": utcnow(), "git_sha": git_sha,
             "model": model,
+            # a run strategy, not infrastructure: seeded runs start at the
+            # 0.6016 bar, unseeded ones draft their way there. Comparing one
+            # against the other is meaningless, so it is recorded.
+            "seed_baseline": seed_baseline,
             "limits": {k: limits[k] for k in
                        ("max_iterations", "wall_clock_s", "epsilon", "N")},
             "data_dir": data_dir, "seeds": seeds, "dev_mode": dev_mode})

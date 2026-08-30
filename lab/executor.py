@@ -160,6 +160,10 @@ def run(code: str, node_dir: str, seed: int, timeout_s: int,
     # 0.5 -- the model is broken, not merely weak. Surfacing it lets judge()
     # reject it for the right reason instead of treating it as a real result.
     m["degenerate"] = bool(np.ptp(scores) < 1e-12)
+    # GAUC meaningfully below 0.5 means the ranking is INVERTED -- random
+    # scoring gets 0.5, so doing worse takes real signal pointed backwards.
+    # Almost always a sign error in a gradient or score.
+    m["inverted"] = bool(m["GAUC"] < 0.45)
     return {"status": "ok", "metrics": m, "error": None}
 
 
@@ -171,4 +175,5 @@ def mean_metrics(runs: list[dict]) -> dict:
     out["users"] = runs[0]["users"]
     out["rows"] = runs[0]["rows"]
     out["degenerate"] = any(r.get("degenerate") for r in runs)
+    out["inverted"] = any(r.get("inverted") for r in runs)
     return out
