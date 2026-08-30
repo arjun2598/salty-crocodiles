@@ -155,8 +155,12 @@ def run(code: str, node_dir: str, seed: int, timeout_s: int,
                           "message": "scores contain NaN or Inf",
                           "traceback_tail": ""}}
 
-    return {"status": "ok", "metrics": evaluate(users, labels, list(scores)),
-            "error": None}
+    m = evaluate(users, labels, list(scores))
+    # Constant (or near-constant) scores tie every pair, giving GAUC exactly
+    # 0.5 -- the model is broken, not merely weak. Surfacing it lets judge()
+    # reject it for the right reason instead of treating it as a real result.
+    m["degenerate"] = bool(np.ptp(scores) < 1e-12)
+    return {"status": "ok", "metrics": m, "error": None}
 
 
 def mean_metrics(runs: list[dict]) -> dict:
@@ -166,4 +170,5 @@ def mean_metrics(runs: list[dict]) -> dict:
     out = {k: sum(r[k] for r in runs) / n for k in keys}
     out["users"] = runs[0]["users"]
     out["rows"] = runs[0]["rows"]
+    out["degenerate"] = any(r.get("degenerate") for r in runs)
     return out

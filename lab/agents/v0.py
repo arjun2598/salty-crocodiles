@@ -142,6 +142,54 @@ OUTPUT CONTRACT
   You are free to ignore guard.encode and build your own features from the
   tuples. Do not import pandas, sklearn, or torch.
 
+  WHAT IS ALREADY KNOWN -- these were measured by the organizers. Do not
+  re-run them.
+
+    Dead ends:
+    - More static features. Adding all 13 CWM feature fields (music_id,
+      video_type, upload_type, plus six coarse user buckets) scored 0.5940
+      against 0.5950 for the five baseline fields. No gain, slightly worse.
+    - More capacity. Embedding dim 8 / 16 / 32 gives 0.5895 / 0.5902 / 0.5887.
+      It barely moves. 1.14M rows will not support a bigger model.
+    - Why: the user_id x video_id cross already captures most of the learnable
+      signal, and coarse user buckets are redundant next to user_id.
+    - Pure user-side first-order terms contribute EXACTLY ZERO. Ranking is
+      within-user, so any term that is constant across a user's impressions
+      cannot change their order. User features can only help through crosses
+      with item-side features.
+
+  WHERE THE HEADROOM IS -- unexplored, in the organizers' order of promise:
+
+    1. Change the loss. Training is pointwise logloss; the metrics are ranking
+       metrics. Pairwise (BPR over within-user positive/negative pairs) or
+       listwise (softmax over each user's impressions) aligns the objective
+       with how you are scored. Judged most likely to work.
+    2. User history sequences. The current features use no behavioural
+       sequence at all, yet each user has hundreds to thousands of training
+       interactions. DIN / SIM style interest modelling is completely
+       untouched here.
+    3. Multi-task. The logs carry is_click, is_like, is_follow, is_comment,
+       is_forward and play_time_ms. Use them as auxiliary tasks for the
+       long_view objective.
+    4. Watch-time modelling. A completed play means the true watch time was
+       truncated by the video length, so a censored / one-sided loss beats
+       squared error (this is the CWM paper's contribution).
+    5. A different architecture (DeepFM / DCN / xDeepFM). Lower priority --
+       capacity is measurably not the bottleneck.
+    6. Time features and distribution drift: hourmin, date, and the shift
+       between the train and evaluation windows.
+
+  MORE DATA IS AVAILABLE than guard.load() returns. Inside args.data_dir:
+    log_standard_*.csv  -- user_id, video_id, date, hourmin, time_ms,
+        is_click, is_like, is_follow, is_comment, is_forward, is_hate,
+        long_view, play_time_ms, duration_ms, profile_stay_time,
+        comment_stay_time, is_profile_enter, is_rand, tab
+    user_features_pure.csv          -- activity, follower/fan/friend counts, ...
+    video_features_basic_pure.csv   -- author_id, video_type, upload_type, ...
+    video_features_statistic_pure.csv -- show/play/complete counts per video
+  Read them with the csv module if you need signals 2-4 above. Row order for
+  the valid split is still whatever guard.load() returns -- align to that.
+
   It must:
     - train on train only
     - write a float array to args.out, one score per valid row, in the order
@@ -209,6 +257,9 @@ def judge(candidate: Node, incumbent: Node | None,
     problem. Does NOT require the gain to exceed noise."""
     if candidate.metrics is None:
         return False, f"no metrics (status={candidate.status})"
+    if candidate.metrics.get("degenerate"):
+        return False, "constant scores -- every pair ties, GAUC is 0.5 by "\
+                      "construction. The model is broken, not weak."
     if incumbent is None or incumbent.metrics is None:
         return True, "first scored solution becomes the incumbent"
     delta = candidate.primary - incumbent.primary

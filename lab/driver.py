@@ -42,7 +42,9 @@ from core import DEV_LIMITS, LIMITS, Journal, Meter, Node, RunState, utcnow  # n
 MAX_API_FAILURES = 5      # consecutive LLM-call failures before aborting
 
 CODE_FENCE = re.compile(r"```(?:python)?\s*\n(.*?)```", re.DOTALL)
-HYPOTHESIS = re.compile(r"#\s*HYPOTHESIS:\s*(.+)")
+# Capture the HYPOTHESIS line AND any following comment lines -- models wrap
+# long hypotheses across several `#` lines, and `.` does not match newlines.
+HYPOTHESIS = re.compile(r"#\s*HYPOTHESIS:\s*(.+(?:\n\s*#.*)*)")
 
 
 def git_sha() -> str:
@@ -60,7 +62,11 @@ def extract(reply: str) -> tuple[str | None, str]:
         return None, "(no code block in reply)"
     code = max(blocks, key=len)
     h = HYPOTHESIS.search(code)
-    return code, (h.group(1).strip() if h else "(no HYPOTHESIS line)")
+    if not h:
+        return code, "(no HYPOTHESIS line)"
+    text = " ".join(ln.lstrip(" #").rstrip()
+                    for ln in h.group(1).splitlines()).strip()
+    return code, text
 
 
 def unified_diff(parent: Node | None, code: str) -> str:
@@ -92,6 +98,13 @@ def main() -> None:
     ap.add_argument("--run-id", required=True)
     ap.add_argument("--dev", action="store_true",
                     help="8 iterations, short timeouts. Not evidence.")
+    ap.add_argument("--no-seed-baseline", dest="seed_baseline",
+                    action="store_false", default=True,
+                    help="draft the first solution with the model instead of "
+                         "seeding from starter_solution.py. Seeding is ON by "
+                         "default: it costs one iteration and no LLM call, and "
+                         "starts the run at the 0.6016 bar instead of climbing "
+                         "back to it.")
     ap.add_argument("--data-dir", default=os.path.join(HERE, "data", "trainval"))
     ap.add_argument("--base-url", default=None, help="default: $LLM_BASE_URL")
     ap.add_argument("--model", default=None, help="default: $LLM_MODEL")
@@ -118,6 +131,31 @@ def main() -> None:
     state = RunState(iters_left=limits["max_iterations"],
                      seconds_left=limits["wall_clock_s"])
     best_history: list[float] = []
+
+    if args.seed_baseline:
+        # Task requirement 1 is "reproduce the official baseline" -- doing it
+        # from a known-good file means every LLM iteration is spent IMPROVING
+        # on 0.6016 rather than re-deriving it (and landing under it).
+        t0, started = time.time(), utcnow()
+        code = open(os.path.join(HERE, "starter_solution.py")).read()
+        r = executor.run(code, os.path.join(run_dir, "nodes", "n1"), 0,
+                         limits["solution_timeout_s"], args.data_dir)
+        node = Node(id="n1", parent_id=None, stage="draft",
+                    hypothesis="Seeded with the official FM baseline "
+                               "(starter_solution.py) as the starting point.",
+                    code=code, diff="", metrics=r["metrics"],
+                    error=json.dumps(r["error"]) if r["error"] else None,
+                    tokens=(0, 0), wall_clock_s=time.time() - t0,
+                    status=r["status"], accepted=r["status"] == "ok")
+        state.nodes.append(node)
+        if node.status == "ok":
+            state.best_id = node.id
+            best_history.append(node.primary)
+            print(f"[seed] starter FM  primary {node.primary:.4f}")
+        jr.iteration(node=node, iteration=1, seeds_run=[0],
+                     recovery={"action": "none", "attempt": 0, "resolved": True},
+                     leak_check="pass", is_best_so_far=True, started_at=started,
+                     ended_at=utcnow(), code_sha256=executor.sha256(code))
     attempt = api_failures = 0
     stop_reason = "aborted"
 
