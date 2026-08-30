@@ -78,12 +78,16 @@ def unified_diff(parent: Node | None, code: str) -> str:
 
 
 def converged(best_history: list[float], limits: dict) -> bool:
-    """valid primary has not improved by more than epsilon over the last N.
+    """The competition rule, taken literally:
 
-    best_history holds one entry per SUCCESSFULLY EVALUATED iteration. A
-    crashed iteration produces no validation score at all, so it cannot be
-    "a validation score that failed to improve" -- counting it would end runs
-    early on infrastructure noise rather than on genuine convergence.
+        "converged when the validation score has not improved by more than
+         eps = 0.002 over the last N = 3 consecutive iterations"
+
+    ITERATIONS, not evaluations. A crashed iteration is still an iteration and
+    still consumed budget, so it counts -- best_history gets one entry per
+    iteration, carrying the current best forward when an iteration produces no
+    score. This is stricter than counting scored iterations only, and it is
+    what the text says.
     """
     n = limits["N"]
     if len(best_history) < n + 1:
@@ -264,8 +268,9 @@ def main() -> None:
             print(f"  {'ACCEPT' if accept else 'reject'} -- {why}")
 
         state.nodes.append(node)                                      # 8
-        if node.status == "ok":        # scored iterations only -- see converged()
-            best_history.append(state.best.primary if state.best else 0.0)
+        # every iteration counts, scored or not -- see converged()
+        if state.best is not None:
+            best_history.append(state.best.primary)
         jr.iteration(node=node, iteration=state.iteration, seeds_run=seeds,
                      recovery=recovery, leak_check=leak,
                      is_best_so_far=(state.best_id == node.id),
