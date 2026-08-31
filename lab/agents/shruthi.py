@@ -20,6 +20,7 @@ that list is your backlog.
 from __future__ import annotations
 
 from core import LIMITS, Node, RunState, Stage, rough_tokens
+import json
 
 BASE = LIMITS["baseline_primary"]["valid"]      # 0.6016 -- the bar
 CEILING = LIMITS["oracle_primary"]["valid"]     # 0.8484 -- perfect ranking
@@ -131,7 +132,7 @@ def research_axis(state: RunState, parent: Node | None = None) -> str:
         RESEARCH_AXES,
         key=lambda axis: max(results[axis])
     )
-    
+
 # ==========================================================================
 # 1. SEARCH -- what do we work on next?
 # ==========================================================================
@@ -477,23 +478,73 @@ def judge(candidate: Node, incumbent: Node | None,
 # ==========================================================================
 MAX_ATTEMPTS = 3
 
+# Failures a traceback usually lets the model fix on the next try.
+FIXABLE = {
+    "TypeError", "AttributeError", "NameError", "IndexError",
+    "KeyError", "ValueError", "ImportError", "ModuleNotFoundError",
+    "NoCode", "Misaligned", "NoOutput"
+}
+
+
+def _error_type(node: Node) -> str:
+    if not node.error:
+        return ""
+
+    try:
+        error = json.loads(node.error)
+    except (ValueError, TypeError):
+        return ""
+
+    kind = error.get("type", "")
+
+    # NonZeroExit only tells us that the generated program crashed.
+    # Look inside the traceback for the actual Python error so recovery
+    # can decide whether it is fixable.
+    if kind == "NonZeroExit":
+        traceback = error.get("traceback_tail", "")
+
+        for fixable in FIXABLE:
+            if f"{fixable}:" in traceback:
+                return fixable
+
+    return kind
+
 
 def on_failure(node: Node, attempt: int, state: RunState) -> str:
-    """Retry with the traceback, roll back once there is something to roll back
-    to, and only abandon when the budget is genuinely spent.
+    """Route recovery based on what actually failed."""
 
-    Never abandon while iterations remain -- early drafts are exactly where
-    failures are expected, and abandoning kills the run with budget unused.
+    kind = _error_type(node)
 
-    Does NOT: look at WHAT broke. A missing import, an inverted-sign logic bug,
-    a NaN blow-up and a timeout are all treated identically here. It does not
-    notice it is retrying the same failing fix twice, and it re-runs unchanged
-    code after a timeout, which times out again. Under the convergence rule a
-    crash costs an iteration AND a slot in the 3-iteration window, so this is
-    worth real work. That work is lane D's.
-    """
-    if attempt < MAX_ATTEMPTS:
+    # If the same error keeps happening, stop wasting attempts
+    # and return to something that previously worked.
+    prior = [_error_type(n) for n in state.nodes if n.status != "ok"]
+
+    if kind and prior[-1:] == [kind] and attempt >= 2:
+        return "rollback" if state.best_id else "retry"
+
+    # Timeout: give the model one chance to make the experiment smaller.
+    if node.status == "timeout":
+        return "retry" if attempt < 2 else (
+            "rollback" if state.best_id else "abandon"
+        )
+
+    # Numerical failure such as NaN/Inf.
+    if kind == "NonFinite":
+        return "retry" if attempt < 2 else (
+            "rollback" if state.best_id else "retry"
+        )
+
+    # Data leakage should not be repaired by repeatedly retrying
+    # the same experiment.
+    if node.status == "leak":
+        return "rollback" if state.best_id else "retry"
+
+    # Normal coding errors are usually worth repairing.
+    if kind in FIXABLE and attempt < MAX_ATTEMPTS:
         return "retry"
+
     if state.best_id:
         return "rollback"
+
+    # Avoid abandoning while useful iteration budget remains.
     return "retry" if state.iters_left > 1 else "abandon"
