@@ -30,108 +30,117 @@ RESEARCH_AXES = [
     "user_history",
     "multi_task",
     "watch_time",
+    "time_drift",
+    "architecture",
 ]
+
+# Concrete experiment ladder. The planner chooses the research area; this ladder
+# stops the coding model from having to invent a completely new experiment from
+# scratch every iteration.
+EXPERIMENT_RECIPES = {
+    "loss": [
+        "Implement within-user pairwise BPR loss. Sample positive/negative impressions from the same user and keep the existing FM scoring function.",
+        "Try a numerically stable within-user listwise softmax objective while keeping the existing FM architecture.",
+        "Refine the best ranking loss with conservative regularization or pair sampling; do not rewrite the model.",
+    ],
+    "user_history": [
+        "Add a leakage-safe user-history affinity signal built only from TRAIN interactions, e.g. recent positive author/video preference, and use it to rank validation impressions.",
+        "Add recency weighting to the train-only user-history signal so recent positive interactions matter more than old ones.",
+        "Combine the strongest train-only history signal with the incumbent model using a small deterministic score weight.",
+    ],
+    "multi_task": [
+        "Read auxiliary TRAIN behaviour columns such as is_click/is_like/is_follow/is_comment/is_forward and create a train-only engagement signal that helps learn long_view ranking.",
+        "Use a conservative weighted auxiliary engagement target while keeping long_view as the evaluated target; avoid validation-label leakage.",
+        "Combine the best auxiliary behavioural signal with the incumbent score rather than replacing the whole model.",
+    ],
+    "watch_time": [
+        "Use TRAIN play_time_ms and duration_ms to derive a bounded completion/watch-ratio auxiliary signal; keep long_view as the evaluation target.",
+        "Model completed plays as censored by video duration using a simple robust one-sided or capped watch-time signal.",
+        "Blend the strongest watch-time-derived signal with the incumbent ranking using a conservative weight.",
+    ],
+    "time_drift": [
+        "Add a simple time/drift-aware item or author statistic from TRAIN only, using date/hourmin without validation labels.",
+        "Use recency-weighted TRAIN statistics so behaviour closer to the validation window has more influence.",
+        "Blend the best temporal signal with the incumbent score conservatively.",
+    ],
+    "architecture": [
+        "Only if simpler directions have been explored: add a small nonlinear interaction on top of the existing FM without increasing embedding size aggressively.",
+        "Try a lightweight explicit cross/interactions extension that fits CPU/time limits and preserves the working data/output pipeline.",
+    ],
+}
 
 
 def _axis_from_hypothesis(hypothesis: str) -> str | None:
     """Infer which research axis a previous experiment investigated."""
     text = (hypothesis or "").lower()
-
     keywords = {
-        "loss": [
-            "loss", "bpr", "pairwise", "listwise", "ranking objective",
-        ],
-        "user_history": [
-            "user history", "history", "sequence", "din", "sim",
-            "behavioural", "behavioral",
-        ],
-        "multi_task": [
-            "multi-task", "multitask", "auxiliary", "click", "like",
-            "follow", "comment", "forward",
-        ],
-        "watch_time": [
-            "watch time", "watch-time", "play time", "play_time",
-            "censored", "duration",
-        ],
+        "loss": ["loss", "bpr", "pairwise", "listwise", "ranking objective"],
+        "user_history": ["user history", "history", "sequence", "recency", "affinity", "din", "sim"],
+        "multi_task": ["multi-task", "multitask", "auxiliary", "engagement", "click", "like", "follow", "comment", "forward"],
+        "watch_time": ["watch time", "watch-time", "play time", "play_time", "watch ratio", "completion", "censored", "duration"],
+        "time_drift": ["time drift", "temporal", "hourmin", "date feature", "recency-weighted", "distribution drift"],
+        "architecture": ["architecture", "deepfm", "dcn", "xdeepfm", "nonlinear", "cross network"],
     }
-
     for axis, words in keywords.items():
         if any(word in text for word in words):
             return axis
-
     return None
 
 
-def research_axis(state: RunState, parent: Node | None = None) -> str:
-    """Choose the next research direction using evidence-aware explore -> exploit."""
+def _axis_scores(state: RunState) -> dict[str, list[float]]:
+    results = {axis: [] for axis in RESEARCH_AXES}
+    for node in state.nodes:
+        if node.status == "ok" and node.primary is not None:
+            axis = _axis_from_hypothesis(node.hypothesis)
+            if axis:
+                results[axis].append(node.primary)
+    return results
 
-    # DEBUG:
-    # A crash is not a new ML experiment.
-    # Keep trying to repair the same research idea.
+
+def research_axis(state: RunState, parent: Node | None = None) -> str:
+    """Evidence-aware explore -> exploit, with cheap/high-priority ideas first."""
     if parent is not None and parent.status != "ok":
         previous_axis = _axis_from_hypothesis(parent.hypothesis)
         if previous_axis:
             return previous_axis
 
-    # Collect the scores achieved by each research direction.
-    results = {axis: [] for axis in RESEARCH_AXES}
-
-    for node in state.nodes:
-        if node.status != "ok" or node.primary is None:
-            continue
-
-        axis = _axis_from_hypothesis(node.hypothesis)
-
-        if axis is not None:
-            results[axis].append(node.primary)
-
-    # EXPLOIT EARLY:
-    # If an axis has produced a meaningful improvement, keep developing it.
-    # But if two follow-up experiments fail to beat its best score,
-    # consider that direction temporarily exhausted and explore elsewhere.
-    meaningful_gain = 0.002
+    results = _axis_scores(state)
+    meaningful_gain = LIMITS["epsilon"]
     max_stale_followups = 2
 
     promising = []
-
     for axis in RESEARCH_AXES:
         scores = results[axis]
-
         if not scores:
             continue
-
         best_score = max(scores)
-
         if best_score < BASE + meaningful_gain:
             continue
-
-        # Find when this axis achieved its best result.
         best_index = scores.index(best_score)
-
-        # Count scored experiments on this axis after that breakthrough.
-        stale_followups = len(scores) - best_index - 1
-
-        if stale_followups < max_stale_followups:
+        stale = len(scores) - best_index - 1
+        if stale < max_stale_followups:
             promising.append((best_score, axis))
 
     if promising:
-        promising.sort(reverse=True)
-        return promising[0][1]
+        return max(promising)[1]
 
-    # EXPLORE:
-    # Nothing has clearly worked yet, so try a research direction
-    # that has not received a scored experiment.
+    # Explore in deliberate order: ranking alignment first, expensive model
+    # architecture last. A failed implementation does not count as evidence.
     for axis in RESEARCH_AXES:
         if not results[axis]:
             return axis
 
-    # FALLBACK:
-    # We explored everything but nothing beat the noise threshold.
-    # Continue with whichever direction performed best.
-    return max(
-        RESEARCH_AXES,
-        key=lambda axis: max(results[axis])
-    )
+    return max(RESEARCH_AXES, key=lambda axis: max(results[axis]))
+
+
+def experiment_recipe(state: RunState, axis: str) -> str:
+    """Return a concrete next experiment inside an axis."""
+    scored = 0
+    for node in state.nodes:
+        if node.status == "ok" and node.primary is not None and _axis_from_hypothesis(node.hypothesis) == axis:
+            scored += 1
+    recipes = EXPERIMENT_RECIPES[axis]
+    return recipes[min(scored, len(recipes) - 1)]
 
 # ==========================================================================
 # 1. SEARCH -- what do we work on next?
@@ -165,95 +174,45 @@ def select(state: RunState) -> tuple[Node | None, Stage]:
 # 2. CONTEXT -- what does the model get to see?
 # ==========================================================================
 def formulate(state: RunState, parent: Node | None, budget_tokens: int) -> str:
-    """Give the LLM the experimental history plus an explicit research agenda."""
+    """Compact evidence + a REAL working solution.
 
-    parts = [
-        f"## Where we stand\n"
-        f"baseline to beat: {BASE}   "
-        f"oracle ceiling: {CEILING}"
-    ]
+    Important: a NoCode node has empty code.  On that failure, show the best
+    runnable solution instead of asking the model to reconstruct everything
+    from scratch.
+    """
+    parts = [f"## Status\nbaseline: {BASE}   oracle: {CEILING}"]
 
     best = state.best
-
     if best and best.metrics:
         parts.append(
-            f"best so far: {best.primary:.4f} "
-            f"(node {best.id}, delta {best.primary - BASE:+.4f})"
+            f"best: {best.primary:.4f} (node {best.id}, delta {best.primary - BASE:+.4f})"
         )
 
-    # --------------------------------------------------------------
-    # SHRUTHI V1: explicit explore -> exploit research planning
-    # --------------------------------------------------------------
     axis = research_axis(state, parent)
-
-    axis_guidance = {
-        "loss": (
-            "LOSS / RANKING OBJECTIVE. Investigate a ranking-aligned objective "
-            "such as pairwise BPR or a listwise objective instead of merely "
-            "adding model capacity."
-        ),
-        "user_history": (
-            "USER HISTORY. Investigate behavioural history or sequence-derived "
-            "signals that can change the ranking among a user's impressions."
-        ),
-        "multi_task": (
-            "MULTI-TASK SIGNALS. Investigate auxiliary behavioural signals such "
-            "as click, like, follow, comment, forward, or play time while keeping "
-            "long_view as the target being evaluated."
-        ),
-        "watch_time": (
-            "WATCH-TIME MODELLING. Investigate play-time/duration information, "
-            "including the censoring/truncation issue described in the task."
-        ),
-    }
-
-    parts.append(
-        "\n## Research plan for this iteration\n"
-        f"Selected axis: {axis}\n"
-        f"{axis_guidance[axis]}\n"
-        "Treat this as the research hypothesis for this iteration. "
-        "Do not silently switch to another research axis."
-    )
+    recipe = experiment_recipe(state, axis)
+    parts.append(f"## Experiment\n{recipe}")
 
     if state.nodes:
-        rows = [
-            "",
-            "## Experimental history",
-            "| node | stage | status | primary | inferred axis | hypothesis |",
-            "|---|---|---|---|---|---|",
-        ]
-
-        for n in state.nodes:
+        rows = ["## Evidence"]
+        for n in state.nodes[-4:]:
             p = f"{n.primary:.4f}" if n.primary is not None else "--"
-            inferred = _axis_from_hypothesis(n.hypothesis) or "--"
-
-            rows.append(
-                f"| {n.id} | {n.stage} | {n.status} | {p} | "
-                f"{inferred} | {n.hypothesis[:70]} |"
-            )
-
+            rows.append(f"{n.id}: {n.status}, primary={p}, {n.hypothesis[:80]}")
         parts.append("\n".join(rows))
 
-    if parent:
-        if parent.status != "ok" and parent.error:
-            parts.append(
-                f"\n## The failure to fix\n"
-                f"```\n{parent.error}\n```"
-            )
+    if parent and parent.status != "ok" and parent.error:
+        parts.append(f"## Failure\n{parent.error}")
 
+    # Never feed an empty NoCode solution back to the coding model.
+    working = parent if parent and parent.code else best
+    if working and working.code:
         parts.append(
-            f"\n## Current solution ({parent.id})\n"
-            f"```python\n{parent.code}\n```"
+            f"## Working solution ({working.id}) -- preserve this code\n"
+            f"```python\n{working.code}\n```"
         )
 
-    text = "\n".join(parts)
-
+    text = "\n\n".join(parts)
     if rough_tokens(text) > budget_tokens:
-        text = (
-            text[: budget_tokens * 4]
-            + "\n... [truncated by agents/shruthi]"
-        )
-
+        text = text[: budget_tokens * 4] + "\n... [truncated by agents/shruthi]"
     return text
 
 # ==========================================================================
@@ -389,46 +348,51 @@ OUTPUT CONTRACT
 
 def build(state: RunState, parent: Node | None, stage: Stage,
           context: str) -> tuple[str, list[dict]]:
-    """One system prompt, one user turn.
+    """Research policy stays rich; coding request stays brutally compact."""
+    compact = (
+        "OUTPUT RULES:\n"
+        "- First characters: ```python\n"
+        "- Last characters: ```\n"
+        "- ONE complete runnable solution.py, preferably <=130 lines.\n"
+        "- No prose, reasoning, docstrings, long comments, or pseudocode.\n"
+        "- Preserve working code literally where possible; make the smallest edit.\n"
+        "- Do not re-explain or re-architect working infrastructure.\n"
+        "- Finish the code and closing fence before anything else.\n"
+    )
 
-    Does NOT: vary tone or structure by stage beyond one sentence, give
-    worked examples, ask for a plan before code, or say anything about the
-    dataset's known dead ends (static features and model capacity are both
-    measured non-starters -- see the starter kit README).
-    """
     if stage == "draft":
-        ask = ("Write a first solution. A factorization machine over the "
-               "categorical fields is a reasonable starting point.")
+        ask = (
+            "Write the smallest complete runnable baseline solution.py.\n" + compact
+        )
     elif stage == "debug":
-        ask = ("The solution above failed. Fix ONLY the error.\n"
-               "Change as little as possible: keep the same model, the same "
-               "loss, the same hyperparameters, the same structure. Do not "
-               "take the opportunity to try a different idea -- a repair that "
-               "also rewrites the approach cannot be told apart from a "
-               "regression, and it wastes the iteration either way.\n"
-               "State the root cause in the HYPOTHESIS line, then output the "
-               "complete corrected solution.py.")
+        # NoCode means there is no broken program to repair. Re-attempt the
+        # selected experiment from the working incumbent shown in context.
+        no_code = parent is not None and _error_type(parent) == "NoCode"
+        if no_code:
+            axis = research_axis(state, parent)
+            recipe = experiment_recipe(state, axis)
+            ask = (
+                f"Implement this experiment on the WORKING solution: {recipe}\n"
+                "The previous response was truncated/missing a complete code fence. "
+                "Do NOT reconstruct or expand the program unnecessarily.\n" + compact
+            )
+        else:
+            ask = (
+                "Fix ONLY the shown failure. Keep the same experiment and change "
+                "the minimum number of lines.\n" + compact
+            )
     else:
         axis = research_axis(state, parent)
-
+        recipe = experiment_recipe(state, axis)
         ask = (
-            f"Improve on the solution above. Change ONE thing.\n"
-            f"For this experiment, investigate the research direction: {axis}.\n"
-            f"Keep the change focused on {axis}; do not switch to another "
-            f"research direction.\n"
-            "Copy everything you are not changing VERBATIM from the current "
-            "solution -- the training loop, the encoder, the argument "
-            "parsing and the output writing already work. Most failures in "
-            "this run came from retyping code that was already correct, not "
-            "from the idea being wrong.\n"
-            "Say what you are changing and why in the HYPOTHESIS line, then "
-            "output the complete new solution.py."
+            f"Implement ONE experiment on the working solution: {recipe}\n"
+            "Keep the existing model/training/CLI/output code unchanged unless this "
+            "experiment strictly requires a small edit.\n" + compact
         )
 
-    budget = (f"Iteration {state.iteration}. {state.iters_left} iterations and "
-              f"{int(state.seconds_left / 60)} minutes remain.")
+    budget = (f"Iteration {state.iteration}; {state.iters_left} iterations; "
+              f"{int(state.seconds_left / 60)} minutes left.")
     return SYSTEM, [{"role": "user", "content": f"{context}\n\n{budget}\n\n{ask}"}]
-
 
 # ==========================================================================
 # 4. VALIDATION -- real improvement, or seed noise?
@@ -466,10 +430,11 @@ def judge(candidate: Node, incumbent: Node | None,
     if incumbent is None or incumbent.metrics is None:
         return True, "first scored solution becomes the incumbent"
     delta = candidate.primary - incumbent.primary
+    min_gain = 2 * LIMITS["seed_std"]
+    if delta >= min_gain:
+        return True, f"primary {delta:+.4f} (clears 2-sigma noise threshold {min_gain:.4f})"
     if delta > 0:
-        noisy = delta < 2 * LIMITS["seed_std"]
-        note = " (within 2 sigma of seed noise -- v0 takes it anyway)" if noisy else ""
-        return True, f"primary {delta:+.4f}{note}"
+        return False, f"primary {delta:+.4f} -- positive but within seed noise; do not promote"
     return False, f"primary {delta:+.4f}"
 
 
