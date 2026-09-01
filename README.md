@@ -234,7 +234,7 @@ For example:
 python3 lab/driver.py --member shruthi --dev
 ```
 
-The corresponding agent implementation lives in `lab/agents/shruthi.py`.
+The corresponding agent implementation lives in `lab/agents/shruthi_v2_2_minprompt_bprsafe.py`.
 
 Each iteration generates a node under the run directory and records its result in:
 
