@@ -57,4 +57,27 @@ htmlcov/
 scratch/
 tmp/
 *.local.*
+
+# Secrets. Broad on purpose: `.env` alone misses `.env.local`, `.env.bak`,
+# and macOS duplicates like `.env 2` / `.env copy`.
 .env
+.env*
+*.env
+*.env*
+
+
+# ---- Lab -------------------------------------------------------------------
+lab/data/
+lab/.venv/
+
+# journals and intervention logs ARE graded deliverables -- re-include them
+# first (the blanket `runs/` rule above would otherwise swallow them), THEN
+# carve the heavy bits back out. Last matching pattern wins in git.
+!lab/runs/
+!lab/runs/**/journal.jsonl
+!lab/runs/**/interventions.md
+
+# generated solution.py per node: large, not graded
+lab/runs/*/*/nodes/
+# dev-mode runs are not evidence
+lab/runs/*/dev-*/
